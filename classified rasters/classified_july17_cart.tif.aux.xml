@@ -1,0 +1,15 @@
+<PAMDataset>
+  <PAMRasterBand band="1">
+    <CategoryNames>
+      <Category></Category>
+      <Category>Grassland/pasture</Category>
+      <Category>Lowlands/Marsh</Category>
+      <Category>Dense Forestation</Category>
+      <Category>Native forest</Category>
+      <Category>Rivers and lagoons</Category>
+      <Category>Floating island</Category>
+      <Category>Herbaceous</Category>
+      <Category>Barren land/impervious</Category>
+    </CategoryNames>
+  </PAMRasterBand>
+</PAMDataset>
