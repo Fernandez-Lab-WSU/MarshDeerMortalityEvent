@@ -1,0 +1,701 @@
+---
+title: "Land Cover Classification and Analysis"
+author: "Pilar Fernandez"
+date: "2024-06-07"
+output: html_document
+---
+
+```{r setup-chunk, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+```
+
+# Introduction
+
+This document describes the image classification process as described in Orozco et al.
+
+## Setup
+
+```{r setup}
+
+# Load necessary libraries and set chunk options
+library(here)
+library(raster)
+library(sp)
+library(randomForest)
+library(ggplot2)
+library(dplyr)
+library(gridExtra)
+library(knitr)
+library(kableExtra)
+library(broom)
+library(clipr)
+library(tibble)
+library(rpart)
+library(rasterVis)
+```
+
+## Loading and Preprocessing Data
+
+### Load and Transform Shapefiles
+
+Load the shapefiles of the study site and parks, and transform them to match the coordinate system of the reference raster. We selected the July 2017 raster as reference since it's the image with a broader distribution of land cover types.
+
+```{r load-shapefiles}
+# Load the shapefiles representing the extent of interest
+extent_shapefile <- shapefile(here::here("shp/study_area.shp"))
+ibera_shp <- shapefile(here::here("shp/ibera_UTM.shp"))
+mburucuya_shp <- shapefile(here::here("shp/mburucuya_UTM.shp"))
+
+# Read Landsat images and transform shapefiles to match raster CRS
+stacked_image <- stack(here::here("rasters/stack2017_3-003.tif"))
+extent_shapefile <- spTransform(extent_shapefile, CRS(proj4string(stacked_image)))
+ibera_shp <- spTransform(ibera_shp, CRS(proj4string(stacked_image)))
+mburucuya_shp <- spTransform(mburucuya_shp, CRS(proj4string(stacked_image)))
+```
+
+### Crop Raster to Extent of Shapefile
+
+Crop the raster to the study site and plot an RGB composite image of July 2017.
+
+```{r crop-raster}
+# Crop the raster to the extent of the shapefile
+cropped_image <- mask(stacked_image, extent_shapefile)
+cropped_image <- crop(cropped_image, extent_shapefile)
+
+# Plot RGB composite of the cropped raster
+par(mfrow = c(1, 1))
+plotRGB(cropped_image, r = 1, g = 2, b = 3, stretch = "lin", main = "RGB Composite")
+plot(extent_shapefile, add = TRUE, border = "red", lwd = 3)
+plot(ibera_shp, add = TRUE, border = "yellow", lwd = 3)
+plot(mburucuya_shp, add = TRUE, border = "yellow", lwd = 3)
+legend("topright", legend = c("Study area", "Ibera & Mburucuya"), fill = c("red", "yellow"))
+```
+
+## Unsupervised Classification
+
+### K-means Clustering
+
+Perform K-means clustering on the raster data to classify land cover types.
+
+```{r kmeans-clustering}
+# Perform k-means clustering
+v <- getValues(cropped_image)
+i <- which(!is.na(v))
+v <- na.omit(v)
+set.seed(99)
+num_clusters <- 8
+if (nrow(v) < num_clusters) {
+  stop("Not enough data points after removing missing values. Reduce the number of clusters or handle missing values differently.")
+}
+kmeans_model <- kmeans(v, centers = num_clusters, iter.max = 500, nstart = 5, algorithm = "Lloyd")
+kmeans_raster <- raster(cropped_image)
+kmeans_raster[i] <- kmeans_model$cluster
+```
+
+Plot k-means clustering result
+
+```{r kmeans-plot}
+classcolor <- c("#FF0000", "#00FF00", "#0000FF", "#FFFF00", "#FF00FF", "#00FFFF", "#FFA500", "#A52A2A")
+plot(kmeans_raster, col = classcolor, legend = FALSE)
+legend("topleft", legend = 1:8, fill = classcolor, title = "Class Values", cex = 0.8)
+plot(ibera_shp, add = TRUE, border = "black", lwd = 3)
+```
+
+### Unsupervised Random Forest Classification
+
+Perform unsupervised random forest classification using k-means clusters as input.
+
+```{r unsupervised-rf}
+# Perform unsupervised random forest classification using k-means clusters
+vx <- v[sample(nrow(v), 500), ]
+rf <- randomForest(vx)
+rf_prox <- randomForest(vx, ntree = 1000, proximity = TRUE)$proximity
+E_rf <- kmeans(rf_prox, 9, iter.max = 500, nstart = 10)
+rf <- randomForest(vx, as.factor(E_rf$cluster), ntree = 500)
+rf_raster <- predict(cropped_image, rf)
+```
+
+Plot random forest clustering result
+
+```{r rf-plot}
+plot(rf_raster, col = classcolor, legend = FALSE)
+legend("topleft", legend = 1:8, fill = classcolor, title = "Class Values", cex = 0.8)
+plot(ibera_shp, add = TRUE, border = "black", lwd = 3)
+```
+
+### Unsupervised Random Forest Classification account for temporal variations within the image composite
+
+Because the four images used in the final raster were taken at different time points (because of the satellite path) we also completed the unsupervised classification using the layers less affected by temporal variations and conducted a normalization of the values. Then, we performed unsupervised random forest classification using k-means clusters as input.
+
+```{r unsupervised-normalization}
+# Select bands less affected by temporal variations and apply normalization
+subset_image <- cropped_image[[c(3, 4, 5)]]
+normalized_image <- stretch(subset_image, type = "lin")
+
+# Prepare data for random forest classification
+v_2 <- getValues(normalized_image)
+i_2 <- which(!is.na(v_2))
+v_2 <- na.omit(v_2)
+vx_2 <- v_2[sample(nrow(v_2), 500), ]
+rf_2 <- randomForest(vx_2)
+rf_prox_2 <- randomForest(vx_2, ntree = 1000, proximity = TRUE)$proximity
+E_rf_2 <- kmeans(rf_prox_2, 9, iter.max = 500, nstart = 10)
+rf_2 <- randomForest(vx_2, as.factor(E_rf_2$cluster), ntree = 500)
+rf_raster_2 <- predict(normalized_image, rf_2)
+```
+
+Plot random forest clustering result accounting for temporal variation
+
+```{r plot-rf-temp}
+plot(rf_raster_2, col = classcolor, legend = FALSE)
+legend("topleft", legend = 1:8, fill = classcolor, title = "Class Values", cex = 0.8)
+plot(ibera_shp, add = TRUE, border = "black", lwd = 3)
+```
+
+### Comparison Plot of Different Classification Results
+
+Compare the results of different classification methods.
+
+```{r comparison-plot}
+par(mfrow = c(2, 2))  # Set the plotting layout to 2 rows and 2 columns
+plotRGB(cropped_image, r = 1, g = 2, b = 3, stretch = "lin", main = "RGB Composite")
+plot(ibera_shp, add = TRUE, border = "black", lwd = 2)
+
+plot(kmeans_raster, col = classcolor, legend = FALSE)
+legend("topleft", legend = 1:8, fill = classcolor, title = "Class Values", cex = 0.5)
+plot(ibera_shp, add = TRUE, border = "black", lwd = 2)
+
+plot(rf_raster, col = classcolor, legend = FALSE)
+legend("topleft", legend = 1:8, fill = classcolor, title = "Class Values", cex = 0.5)
+plot(ibera_shp, add = TRUE, border = "black", lwd = 2)
+
+plot(rf_raster_2, col = classcolor, legend = FALSE)
+legend("topleft", legend = 1:8, fill = classcolor, title = "Class Values", cex = 0.5)
+plot(ibera_shp, add = TRUE, border = "black", lwd = 2)
+```
+
+Upon inspection, the kmeans classification model seemed to perform best.
+
+## Supervised Classification
+
+### Train and Apply Supervised Classification Model
+
+Train supervised classification models on the kmeans classified raster and apply them to the original raster data. This is still working with the reference raster of July 2017. We tried two classifiers: CART and Random Forest.
+
+```{r supervised-class-prep}
+# Train supervised classification model on the k-means raster
+LUC <- kmeans_raster
+
+# Get the values (class IDs) from the raster
+raster_values <- getValues(LUC)
+# Count the number of pixels for each class
+class_counts <- table(raster_values)
+# Get the unique values from the raster
+unique_values <- unique(raster_values)
+# Print the counts and unique values
+print(class_counts)
+
+# Now we ratify (RAT = "Raster Attribute Table"): define RasterLayer as a categorical variable. This is helpful for plotting.
+LUC <- ratify(LUC)
+rat <- levels(LUC)
+```
+
+Based on visual inspection with previously classified images and RGB images, we assigned a land cover class to each unique value
+
+```{r supervised-classification}
+LUC_class <- c("Grassland/pasture", "Lowlands/Marsh", "Dense Forestation", "Herbaceous", "Rivers and water bodies", "Emergent herbaceous wetlands", "Shrubs/scrubs", "Barren land/impervious")
+classdf <- data.frame(unique_values = c(1:8), classnames = LUC_class)
+rat$landcover <- LUC_class
+levels(LUC) <- rat
+
+# Define a color palette for each unique value
+classcolor <- rainbow(length(unique_values)-1)
+cbind(classdf,classcolor)
+classcolor[8] <- "#FF0000"
+classcolor[7] <- "#D1BB82"
+classcolor[6] <- "#5843BF"
+classcolor[3] <- "#1E6634"
+classcolor[1] <- "#CCCC00"
+
+#check in a plot 
+plot(LUC, col = classcolor, legend = FALSE)
+legend("topleft", legend = LUC_class, fill = classcolor, bty = "n", cex = 0.4)
+
+# Sampling training sites
+set.seed(99)
+samp <- sampleStratified(LUC, size = 100, na.rm = TRUE, sp = TRUE)
+
+# Extract the layer values for the locations
+sampvals <- extract(cropped_image, samp, df = TRUE)
+sampvals <- sampvals[, -1]
+sampdata <- data.frame(classvalue = samp@data$layer, sampvals)
+
+```
+
+Plot sampling sites
+
+```{r samp-plot}
+par(mfrow = c(1, 1))
+plot(LUC, col = classcolor, legend = FALSE)
+legend("topleft", legend = LUC_class, fill = classcolor, bty = "n", cex = 0.4)
+points(samp, pch = 3, cex = 0.5, lwd = 1, col = 1)
+```
+
+### Model training
+
+```{r model-training}
+# Train the model: cart classifier
+cart <- rpart(as.factor(classvalue) ~ ., data = sampdata, method = 'class', minsplit = 5)
+prLUC <-predict(cropped_image, cart, type = 'class')
+
+# Plot the trained classification tree
+plot(cart, uniform=TRUE, main="Classification Tree")
+text(cart, cex = 0.5)
+
+# Train the model: Random Forest model classifier
+rf_model <- randomForest(as.factor(classvalue) ~ ., data = sampdata, ntree = 500)
+prLUCrf <- predict(cropped_image, rf_model, type = 'response')
+
+#plot classified rasters (with rasterVis)
+
+prLUC <- ratify(prLUC)
+rat <- levels(prLUC)[[1]]
+rat$legend <- classdf$classnames
+levels(prLUC) <- rat
+
+prLUCrf <- ratify(prLUCrf)
+rat <- levels(prLUCrf)[[1]]
+rat$legend <- classdf$classnames
+levels(prLUCrf) <- rat
+
+par(mfrow = c(1, 2))
+levelplot(prLUC, maxpixels = 1e6,
+          col.regions = classcolor,
+          scales=list(draw=FALSE),
+          main = "Supervised classification: CART")
+
+levelplot(prLUCrf, maxpixels = 1e6,
+          col.regions = classcolor,
+          scales=list(draw=FALSE),
+          main = "Supervised classification: RF")
+```
+
+### Now perform a supervised classification of all other images for 2015, 2017, 2018.
+
+We moved forward with the Random Forest model upon visual inspection of the classified images for 2017.
+
+First, we load the images:
+
+```{r load-other}
+# Get the current names of the layers, this is key because all raster layer names will change with the image.
+current_names <- names(cropped_image)
+
+#Fall 2015
+stacked_image2015_2 <- stack(here::here("rasters/stack2015_2-005.tif"))
+cropped_image2015_2 <- mask(stacked_image2015_2, extent_shapefile)
+cropped_image2015_2 <- crop(cropped_image2015_2, extent_shapefile)
+names(cropped_image2015_2) <- current_names
+
+#Summer 2017
+stacked_image2017_1 <- stack(here::here("rasters/stack2017_1-001.tif"))
+cropped_image2017_1 <- mask(stacked_image2017_1, extent_shapefile)
+cropped_image2017_1 <- crop(cropped_image2017_1, extent_shapefile)
+names(cropped_image2017_1) <- current_names
+
+#Fall 2017
+stacked_image2017_2 <- stack(here::here("rasters/stack2017_2-002.tif"))
+cropped_image2017_2 <- mask(stacked_image2017_2, extent_shapefile)
+cropped_image2017_2 <- crop(cropped_image2017_2, extent_shapefile)
+names(cropped_image2017_2) <- current_names
+
+#Fall 2018
+stacked_image2018_2 <- stack(here::here("rasters/stack2018_2-004.tif"))
+cropped_image2018_2 <- mask(stacked_image2018_2, extent_shapefile)
+cropped_image2018_2 <- crop(cropped_image2018_2, extent_shapefile)
+names(cropped_image2018_2) <- current_names
+```
+
+Then, we classify them:
+
+```{r classify-other}
+# Classify the entire raster using the trained model
+prLUCrf_2015_2 <- predict(cropped_image2015_2, rf_model, type = 'response')
+prLUCrf_2017_1 <- predict(cropped_image2017_1, rf_model, type = 'response')
+prLUCrf_2017_2 <- predict(cropped_image2017_2, rf_model, type = 'response')
+prLUCrf_2018_2 <- predict(cropped_image2018_2, rf_model, type = 'response')
+```
+
+## Plot all classified rasters
+
+```{r classified-plot}
+par(mfrow = c(3, 2))
+par(mar = c(0, 0, 2, 0))
+
+plot(prLUCrf_2015_2, col = classcolor, axes = FALSE, box = FALSE, main = "May 2015", legend = FALSE)
+plot(ibera_shp, add = TRUE, border = "black", lwd = 2)
+plot(mburucuya_shp, add = TRUE, border = "black", lwd = 2)
+
+plot(prLUCrf_2017_1, col = classcolor, axes = FALSE, box = FALSE, main = "January 2017", legend = FALSE)
+plot(ibera_shp, add = TRUE, border = "black", lwd = 2)
+plot(mburucuya_shp, add = TRUE, border = "black", lwd = 2)
+
+plot(prLUCrf_2017_2, col = classcolor, axes = FALSE, box = FALSE, main = "April 2017", legend = FALSE)
+plot(ibera_shp, add = TRUE, border = "black", lwd = 2)
+plot(mburucuya_shp, add = TRUE, border = "black", lwd = 2)
+
+plot(prLUCrf, col = classcolor, axes = FALSE, box = FALSE, main = "July 2017", legend = FALSE)
+plot(ibera_shp, add = TRUE, border = "black", lwd = 2)
+plot(mburucuya_shp, add = TRUE, border = "black", lwd = 2)
+
+plot(prLUCrf_2018_2, col = classcolor, axes = FALSE, box = FALSE, main = "May 2018", legend = FALSE)
+plot(ibera_shp, add = TRUE, border = "black", lwd = 2)
+plot(mburucuya_shp, add = TRUE, border = "black", lwd = 2)
+
+plot.new()
+legend("center", legend = c(LUC_class, "Ibera & Mburucuya"), fill = c(classcolor, "white"), 
+       title = "Land use class", bty = "n",
+       title.adj = c(0.5, 0.5), title.col = "black", cex = 0.7)
+```
+
+## Plot April 2017 with deer mortality event
+
+```{r 2017-plot}
+# Load the shapefiles that represents the extent of interest
+
+buffer10k_shp <- shapefile(here::here("shp/mortality events/buffer_10km.shp"))
+mortdeer_shp <- shapefile(here::here("shp/mortality events/mort_events.shp"))
+netsites_shp <- shapefile(here::here("shp/Portals.shp"))
+
+# Transform the shapefile to the same coordinate system as the raster
+mortdeer_shp <- spTransform(mortdeer_shp, CRS(proj4string(stacked_image)))
+buffer10k_shp <- spTransform(buffer10k_shp, CRS(proj4string(stacked_image)))
+netsites_shp <- spTransform(netsites_shp, CRS(proj4string(stacked_image)))
+
+# Plot
+par(mfrow = c(1, 1))  # Set the plotting layout to 1 row and 3 columns
+par(mar = c(0, 0, 2, 0))
+plot(prLUCrf_2017_2, col = classcolor, axes = FALSE, box = FALSE, main = "Mortality events 2017", legend = FALSE)
+plot(extent_shapefile, add = TRUE, border = "black", lwd = 2, lty = 2)
+plot(ibera_shp, add = TRUE, border = "black", lwd = 2)
+plot(mburucuya_shp, add = TRUE, border = "black", lwd = 2)
+plot(mortdeer_shp, add = TRUE, col = "black", pch = 21,bg="red", lwd = "1")
+plot(buffer10k_shp, add = TRUE, border = "red", lwd = 2)
+plot(netsites_shp, add = TRUE, col = "black", pch = 24,bg="blue", lwd = "1", cex= 1.2)
+text(netsites_shp, labels = netsites_shp$name, pos = 4, cex = 0.8, col = "blue", font = 2)
+# add legend
+legend("topleft", legend = c("study area", "Ibera & Mburucuya Parks","Network sites","Mortality Events", "10k Buffer"),
+       col = c("black","black","blue","red", "red"), pch = c(NA, NA, 24, 21, NA), pt.bg = c(NA, NA, "blue", "red", NA), lwd = c(2, 2, NA, NA, 2), lty = c(2, 1, NA, NA, 1), cex = 0.6)
+       
+#Plot with soil types (sup figure)
+
+#load soil types
+sandybanks <- shapefile(here::here("shp/soil types/Sandy_banks.shp")) 
+levees <- shapefile(here::here("shp/soil types/Natural_levee.shp")) 
+sandyridges <- shapefile(here::here("shp/soil types/Sandy_ridges.shp")) 
+sandybanks <- spTransform(sandybanks, CRS(proj4string(stacked_image)))
+levees <- spTransform(levees, CRS(proj4string(stacked_image)))
+sandyridges <- spTransform(sandyridges, CRS(proj4string(stacked_image)))
+
+translucent_black <- rgb(0, 0, 0, alpha = 0.3)
+translucent_blue <- rgb(0, 0, 1, alpha = 0.3)
+translucent_white <- rgb(1, 1, 1, alpha = 0.5)
+
+plot(prLUCrf_2017_2, col = classcolor, axes = FALSE, box = FALSE, main = "Mortality events 2017", legend = FALSE)
+plot(sandybanks, add = TRUE, col = translucent_black, bg = translucent_black)
+plot(levees, add = TRUE, col = translucent_blue, bg = translucent_blue, border = "blue", lwd = 2)
+plot(sandyridges, add = TRUE, col = translucent_white, bg = translucent_white, border = "black", lwd = 2)
+plot(extent_shapefile, add = TRUE, border = "black", lwd = 2, lty = 2)
+plot(mortdeer_shp, add = TRUE, col = "black", pch = 21,bg="red", lwd = "1")
+# add legend
+legend("topleft", legend = c("Study area", "Mortality Events","Sandy Banks", "Sandy Ridges","Natural levees"),
+       fill = c(NA, NA, translucent_black, translucent_white, translucent_blue),
+       border = c(NA, NA, "black", "black", "blue"),
+       lty = c(2, NA, NA, NA, NA), 
+       pch = c(NA, 21, NA, NA, NA),
+       pt.bg = c(NA, "red", NA, NA, NA),
+       lwd = c(2, NA, 2, 2, 2),
+       cex = 0.6)
+```
+
+## Analysis of Land Cover Changes
+
+### 10k Buffer Areas Around Mortality Events
+
+Estimate proportions of land cover types within 10k buffer areas around mortality events.
+
+```{r buffer-areas}
+# Define the raster files
+raster_files <- list(prLUCrf_2015_2, prLUCrf_2017_1, prLUCrf_2017_2, prLUCrf, prLUCrf_2018_2)
+
+names <- c("2015-05", "2017-01", "2017-04", "2017-07", "2018-05")
+
+# Combine all values into one dataset
+combined_data <- data.frame()
+for (i in seq_along(raster_files)) {
+  raster_values <- values(raster_files[[i]])
+  raster_data <- data.frame(Value = raster_values, Raster = names[i])
+  combined_data <- rbind(combined_data, raster_data)
+}
+
+# Show the combined dataset
+combined_data$Raster <- as.factor(combined_data$Raster)
+combined_data$Value <- as.factor(combined_data$Value)
+summary(combined_data)
+combined_data <- na.omit(combined_data)
+
+
+#create database for the 10km buffers
+all_values_list <- list()
+
+for (raster_data in raster_files) {
+  values_list <- list()
+  for (i in 1:length(buffer10k_shp)) {
+    cropped_raster <- crop(raster_data, extent(buffer10k_shp[i, ]))
+    values <- extract(cropped_raster, buffer10k_shp[i, ])
+    values_df <- data.frame(Polygon_ID = rep(i, length(values)), Value = values)
+    values_list[[i]] <- values_df
+  }
+  combined_values_df <- do.call(rbind, values_list)
+  combined_values_df$Raster <- raster_data@file@name
+  all_values_list[[raster_data@file@name]] <- combined_values_df
+}
+
+all_values_df <- bind_rows(all_values_list, .id = "Raster")
+all_values_df <- subset(all_values_df, select = -Polygon_ID)
+names(all_values_df) <- c("Value", "Date")
+all_values_df <- na.omit(all_values_df)
+mapping_table <- data.frame(Date = c(1, 2, 3, 4, 5), Date_ref = c("2015-05", "2017-01", "2017-04", "2017-07", "2018-05"))
+all_values_df$Date <- mapping_table$Date_ref[match(all_values_df$Date, mapping_table$Date)]
+all_values_df <- data.frame(lapply(all_values_df, as.factor))
+
+#create frequency and proportion tables
+frequency_df <- all_values_df %>%
+  group_by(Date, Value) %>%
+  summarise(Frequency = n(), .groups = "drop")
+
+proportions_df <- frequency_df %>%
+  group_by(Date) %>%
+  mutate(Proportion = Frequency / sum(Frequency))
+
+# Define the desired order for sorting the Value variable
+desired_order <- c("5", "2", "6", "3", "4", "1", "7", "8")
+
+# Convert Value to a factor with the desired order of levels
+proportions_df$Value <- factor(proportions_df$Value, levels = desired_order)
+
+# Sort proportions_df by the Value variable in the desired order
+proportions_df <- proportions_df[order(proportions_df$Value), ]
+
+# Filter out rows with NA values in the Proportion column
+proportions_df_clean <- proportions_df %>%
+  filter(!is.na(Proportion))
+
+#Plot proportions for 10k buffer areas
+ggplot(proportions_df_clean, aes(x = Date, y = Proportion, fill = Value)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "10k buffer areas around mortality events", x = "Date", y = "Proportion") +
+  scale_fill_manual(labels = c("Rivers and water bodies",
+                               "Lowlands/Marsh",
+                               "Emergent herbaceous wetlands",
+                               "Dense Forestation",
+                               "Herbaceous",
+                               "Grassland/pasture",
+                               "Shrubs/scrubs",
+                               "Barren land/impervious"),
+                    values = c("#00FFFF",
+                               "#FFBF00", 
+                               "#5843BF",
+                               "#1E6634",
+                               "#00FF40",
+                               "#CCCC00",
+                               "#D1BB82",
+                               "#FF0000")) +
+  theme_minimal()
+```
+
+### Chi-square Test for Land Cover Types
+
+Perform chi-square tests to determine if there are significant differences in land cover types across dates.
+
+```{r chi-square}
+# Chi-square test for differences in land cover types
+proportions_df$Date <- factor(proportions_df$Date, levels = unique(proportions_df$Date))
+proportions_df$Value <- factor(proportions_df$Value, levels = c("5", "2", "6", "3", "4", "1", "7", "8"))
+
+# Calculate the total number of pixels for each raster (date)
+proportions_df <- proportions_df %>%
+  group_by(Date) %>%
+  mutate(Total = sum(Frequency)) %>%
+  ungroup()
+
+# Create a contingency table of frequencies for each land cover type by date
+contingency_table <- xtabs(Frequency ~ Date + Value, data = proportions_df)
+
+# Perform the chi-square test of independence
+chi_square_test <- chisq.test(contingency_table)
+
+# Print the results
+print(chi_square_test)
+
+# Convert the contingency table to a proportion table
+proportion_table <- prop.table(contingency_table, margin = 1)
+
+# Convert the proportion table to a data frame for display
+proportion_df <- as.data.frame.matrix(proportion_table) %>% 
+  rownames_to_column(var = "Date") %>%
+  rename(`Rivers and Water Bodies` = `5`,
+         `Lowlands/Marsh` = `2`,
+         `Emergent Herbaceous Wetlands` = `6`,
+         `Dense Forestation` = `3`,
+         `Herbaceous` = `4`,
+         `Grassland/Pasture` = `1`,
+         `Shrubs/Scrubs` = `7`,
+         `Barren Land/Impervious` = `8`)
+
+# Display the proportion table using kable
+kable(proportion_df, format = "html", digits = 3, col.names = colnames(proportion_df)) %>%
+  kable_styling("striped", full_width = F) %>%
+  add_header_above(c(" ", "Proportions" = 8))
+```
+
+### GLM Analysis for water bodies across dates
+
+Perform a generalized linear model (GLM) analysis to investigate differences water bodies coverage across dates.
+
+```{r glm-analysis}
+# Filter the data for 'Rivers and water bodies'
+rivers_df <- proportions_df[proportions_df$Value == "5", ]
+
+# Create a contingency table of frequencies for each date
+contingency_table_rivers <- xtabs(Frequency ~ Date, data = rivers_df)
+
+# Perform the chi-square test of independence
+chi_square_test_rivers <- chisq.test(contingency_table_rivers)
+
+# Print the results of the chi-square test
+print(chi_square_test_rivers)
+
+# Relevel Date to set "2017-04" as the reference level
+rivers_df$Date <- relevel(rivers_df$Date, ref = "2017-04")
+
+# Fit a GLM to analyze the differences in proportions of rivers and water bodies across dates
+glm_rivers <- glm(cbind(Frequency, Total - Frequency) ~ Date, family = binomial(link = "logit"), data = rivers_df)
+
+# Extract the coefficients and their confidence intervals
+tidy_glm <- broom::tidy(glm_rivers, conf.int = TRUE) %>%
+  mutate(odds_ratio = exp(estimate),
+         conf.low = exp(conf.low),
+         conf.high = exp(conf.high)) %>%
+  select(term, odds_ratio, conf.low, conf.high) %>%
+  rename(Term = term, `Odds Ratio` = odds_ratio, `95% Conf. Low` = conf.low, `95% Conf. High` = conf.high)
+
+# Manually add the reference date with an odds ratio of 1 and no confidence interval
+reference_row <- tibble(Term = "Date2017-04", `Odds Ratio` = 1, `95% Conf. Low` = NA, `95% Conf. High` = NA)
+
+# Combine the reference row with the tidy_glm dataframe
+tidy_glm <- bind_rows(reference_row, tidy_glm)
+
+# Move (Intercept) to the top, followed by the reference value
+tidy_glm <- tidy_glm %>%
+  arrange(factor(Term, levels = c("(Intercept)", "Date2017-04", unique(Term[!Term %in% c("(Intercept)", "Date2017-04")]))))
+
+# Display the table using kable
+kable(tidy_glm, format = "html", digits = 3, col.names = c("Term", "Odds Ratio", "95% Conf. Low", "95% Conf. High")) %>%
+  kable_styling("striped", full_width = F) %>%
+  add_header_above(c(" ", "Odds Ratios with 95% CI" = 3))
+```
+
+## Final Visualizations: MNDWI
+
+```{r MNDWI-load}
+stacked_MNDWI2015_2 <- stack(here::here("rasters/MNDWI_2015_2.tif"))
+cropped_MNDWI2015_2 <- mask(stacked_MNDWI2015_2, extent_shapefile)
+MNDWI2015_2 <- crop(cropped_MNDWI2015_2, extent_shapefile)
+
+stacked_MNDWI2017_1 <- stack(here::here("rasters/MNDWI_2017_1.tif"))
+cropped_MNDWI2017_1 <- mask(stacked_MNDWI2017_1, extent_shapefile)
+MNDWI2017_1 <- crop(cropped_MNDWI2017_1, extent_shapefile)
+
+stacked_MNDWI2017_2 <- stack(here::here("rasters/MNDWI_2017_2.tif"))
+cropped_MNDWI2017_2 <- mask(stacked_MNDWI2017_2, extent_shapefile)
+MNDWI2017_2 <- crop(cropped_MNDWI2017_2, extent_shapefile)
+
+stacked_MNDWI2017_3 <- stack(here::here("rasters/MNDWI_2017_3.tif"))
+cropped_MNDWI2017_3 <- mask(stacked_MNDWI2017_3, extent_shapefile)
+MNDWI2017_3 <- crop(cropped_MNDWI2017_3, extent_shapefile)
+
+stacked_MNDWI2018_2 <- stack(here::here("rasters/MNDWI_2018_2.tif"))
+cropped_MNDWI2018_2 <- mask(stacked_MNDWI2018_2, extent_shapefile)
+MNDWI2018_2 <- crop(cropped_MNDWI2018_2, extent_shapefile)
+```
+
+```{r MNDWI-plot}
+# Plot
+par(mfrow = c(3, 2))  # Set the plotting layout to 1 row and 3 columns
+par(mar = c(0, 0, 2, 0))
+
+# Find the overall minimum and maximum values across all raster layers
+min_value <- min(c(values(MNDWI2015_2), values(MNDWI2017_1), values(MNDWI2017_2), values(MNDWI2017_3), values(MNDWI2018_2)), na.rm = TRUE)
+max_value <- max(c(values(MNDWI2015_2), values(MNDWI2017_1), values(MNDWI2017_2), values(MNDWI2017_3), values(MNDWI2018_2)), na.rm = TRUE)
+
+# Define the color ramp function
+color_ramp <- colorRampPalette(c("#F4F29D", "#2F21EA"))
+
+# Generate the color ramp with a suitable number of colors
+color_palette <- color_ramp(100)
+
+# Set the same color range (zlim) for all plots based on the overall min and max values
+zlim <- c(-0.5, 0.5)
+
+#Fall 2015
+plot(MNDWI2015_2, col = color_palette, axes = FALSE, box = FALSE, main = "May 2015", legend = FALSE, zlim = zlim)
+plot(ibera_shp, add = TRUE, border = "black", lwd = 2)
+plot(mburucuya_shp, add = TRUE, border = "black", lwd = 2)
+
+#Summer 2017
+plot(MNDWI2017_1, col = color_palette, axes = FALSE, box = FALSE, main = "January 2017", legend = FALSE, zlim = zlim)
+plot(ibera_shp, add = TRUE, border = "black", lwd = 2)
+plot(mburucuya_shp, add = TRUE, border = "black", lwd = 2)
+
+#Fall 2017
+plot(MNDWI2017_2, col = color_palette, axes = FALSE, box = FALSE, main = "April 2017", legend = FALSE, zlim = zlim)
+plot(ibera_shp, add = TRUE, border = "black", lwd = 2)
+plot(mburucuya_shp, add = TRUE, border = "black", lwd = 2)
+
+#Winter 2017
+plot(MNDWI2017_3, col = color_palette, axes = FALSE, box = FALSE, main = "July 2017", legend = FALSE, zlim = zlim)
+plot(ibera_shp, add = TRUE, border = "black", lwd = 2)
+plot(mburucuya_shp, add = TRUE, border = "black", lwd = 2)
+
+#Fall 2018
+plot(MNDWI2018_2, col = color_palette, axes = FALSE, box = FALSE, main = "May 2018", legend = TRUE, zlim = zlim)
+plot(ibera_shp, add = TRUE, border = "black", lwd = 2)
+plot(mburucuya_shp, add = TRUE, border = "black", lwd = 2)
+```
+
+```{r MNDWI-values}
+
+# Extract values from each raster
+values_2015_2 <- values(MNDWI2015_2)
+values_2017_1 <- values(MNDWI2017_1)
+values_2017_2 <- values(MNDWI2017_2)
+values_2017_3 <- values(MNDWI2017_3)
+values_2018_2 <- values(MNDWI2018_2)
+
+# Combine values into a data frame
+df <- data.frame(
+  Year = rep(c("2015_2", "2017_1", "2017_2", "2017_3", "2018_2"), 
+             c(length(values_2015_2), length(values_2017_1), length(values_2017_2), 
+               length(values_2017_3), length(values_2018_2))),
+  Value = c(values_2015_2, values_2017_1, values_2017_2, values_2017_3, values_2018_2)
+)
+
+# Filter out rows with NA values in the Proportion column
+df_clean <- na.omit(df)
+
+# Create overlapping density plots
+ggplot(df_clean, aes(x = Value, fill = Year, color = Year)) +
+  geom_density(alpha = 0.5) +  # Use alpha to show overlapping densities
+  labs(title = "Overlapping Density Plots of MNDWI Values", x = "MNDWI Values", y = "Density") +
+  theme_minimal()
+```
